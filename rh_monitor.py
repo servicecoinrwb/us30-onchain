@@ -398,7 +398,9 @@ h1{font-size:20px;letter-spacing:2px;color:var(--grn)}
 .drift{margin-top:8px;font-size:26px}.pos{color:var(--grn)}.neg{color:var(--red)}.na{color:var(--dim);font-size:16px}
 .ft{margin-top:22px;color:var(--dim);font-size:12px}
 </style></head><body>
-<h1>US30 ONCHAIN</h1><div class="sub">Robinhood Chain · pool vs Chainlink drift · auto-refresh 60s</div>
+<<h1>US30 ONCHAIN</h1><div class="sub">Robinhood Chain · pool vs Chainlink drift · auto-refresh 60s
+ · <a href="https://servicecoinrwb.github.io/The_Scalper/almoner.html" target="_blank" style="color:#ffb84d;text-decoration:none">⚜ THE ALMONER</a>
+ · <a href="https://servicecoinrwb.github.io/The_Scalper/index.html" target="_blank" style="color:#31d07c;text-decoration:none">THE SCALPER</a></div>
 <div class="grid" id="g"></div><div class="ft" id="ft"></div>
 <script>
 async function load(){
