@@ -37,8 +37,10 @@ import json
 import os
 import re
 import sqlite3
+import threading
 import time
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, timezone
 
 from web3 import Web3
@@ -61,14 +63,16 @@ DOCS_CONTRACTS_URL = "https://docs.robinhood.com/chain/contracts"
 # Canonical quote tokens (docs.robinhood.com/chain/contracts)
 USDG = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168"   # USD-pegged — pool price is USD directly
 WETH = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73"   # needs ETH/USD conversion
+# Uniswap v4 singleton (all v4 pools live inside it; needs StateView+poolId to read — future work)
+V4_POOL_MANAGER = "0x8366a39CC670B4001A1121B8F6A443A643e40951"
 ETH_USD_FEED = os.environ.get("RH_ETH_USD_FEED", "0x78F3556b67E17Df817D51Ef5a990cDaF09E8d3A9")  # Chainlink ETH/USD Standard Proxy
 
 # Canonical token addresses from docs.robinhood.com/chain/contracts (July 2026).
 # feed = Chainlink AggregatorV3 proxy (fill from docs.chain.link, network=robinhood)
 # pool = Uniswap v3 pool vs USDG or WETH (fill from Blockscout)
 ASSETS = {
-    "SPY":  {"token": "0x117cc2133c37B721F49dE2A7a74833232B3B4C0C", "feed": "0x319724394D3A0e3669269846abE664Cd621f9f6A", "pool": None},
-    "QQQ":  {"token": "0xD5f3879160bc7c32ebb4dC785F8a4F505888de68", "feed": "0x80901d846d5D7B030F26B480776EE3b29374C2ae", "pool": None},
+    "SPY":  {"token": "0x117cc2133c37B721F49dE2A7a74833232B3B4C0C", "feed": "0x319724394D3A0e3669269846abE664Cd621f9f6A", "pool": "0x5DBEB962FC071137252e013B24E6a3ee35714F2f"},  # Algebra pool
+    "QQQ":  {"token": "0xD5f3879160bc7c32ebb4dC785F8a4F505888de68", "feed": "0x80901d846d5D7B030F26B480776EE3b29374C2ae", "pool": "0xEbD78dcfc8a6b3A696f1E191aD1ff321f9579f79"},  # Uniswap v3 pool (thin!)
     "NVDA": {"token": "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC", "feed": "0x379EC4f7C378F34a1B47E4F3cbeBCbAC3E8E9F15", "pool": None},
     "AAPL": {"token": "0xaF3D76f1834A1d425780943C99Ea8A608f8a93f9", "feed": "0x6B22A786bAa607d76728168703a39Ea9C99f2cD0", "pool": None},
     "MSFT": {"token": "0xe93237C50D904957Cf27E7B1133b510C669c2e74", "feed": "0x45C3C877C15E6BA2EBB19eA114Ea508d14C1Af2E", "pool": None},
@@ -192,13 +196,28 @@ def erc20_decimals(w3, addr):
         _dec_cache[addr] = c.functions.decimals().call()
     return _dec_cache[addr]
 
+def _sqrt_price_x96(w3, pool_addr):
+    """Uniswap v3 slot0() or Algebra globalState() — both return sqrtPriceX96 first."""
+    pool = w3.eth.contract(address=pool_addr, abi=POOL_ABI)
+    try:
+        return pool.functions.slot0().call()[0]
+    except Exception:
+        pass
+    # Algebra-style pool: first word of globalState() is the Q64.96 sqrt price.
+    # Raw call + manual decode so version differences in the rest of the struct don't matter.
+    sel = Web3.keccak(text="globalState()")[:4]
+    raw = w3.eth.call({"to": pool_addr, "data": sel})
+    if len(raw) >= 32:
+        return int.from_bytes(raw[:32], "big")
+    raise RuntimeError(f"pool {pool_addr}: neither slot0() nor globalState() readable")
+
 def read_pool_price(w3, pool_addr, stock_token_addr):
     """
     Uniswap v3 slot0 → price of the stock token in quote-token units.
     Handles either token ordering and mixed decimals (USDG vs 18-dec stock tokens).
     """
     pool = w3.eth.contract(address=Web3.to_checksum_address(pool_addr), abi=POOL_ABI)
-    sqrt_px = pool.functions.slot0().call()[0]
+    sqrt_px = _sqrt_price_x96(w3, Web3.to_checksum_address(pool_addr))
     t0 = pool.functions.token0().call()
     t1 = pool.functions.token1().call()
     d0, d1 = erc20_decimals(w3, t0), erc20_decimals(w3, t1)
@@ -343,14 +362,115 @@ def validate_config(w3):
             print(f"  {ticker} feed OK: {price} ({desc or 'no description'}, updated {updated})")
         except Exception as e:
             problems.append(f"{ticker}: feed {feed} failed latestRoundData(): {e}")
+    for ticker, a in ASSETS.items():
+        if not a.get("pool"):
+            continue
+        try:
+            pool = w3.eth.contract(address=Web3.to_checksum_address(a["pool"]), abi=POOL_ABI)
+            t0 = Web3.to_checksum_address(pool.functions.token0().call())
+            t1 = Web3.to_checksum_address(pool.functions.token1().call())
+            stock = Web3.to_checksum_address(a["token"])
+            if stock not in (t0, t1):
+                problems.append(f"{ticker}: pool {a['pool']} does not contain the {ticker} token")
+                continue
+            quote = t1 if t0 == stock else t0
+            qname = {Web3.to_checksum_address(USDG): "USDG",
+                     Web3.to_checksum_address(WETH): "WETH"}.get(quote, f"UNKNOWN({quote})")
+            px = read_pool_price(w3, a["pool"], a["token"])
+            print(f"  {ticker} pool OK: quote={qname}, price={px}")
+        except Exception as e:
+            problems.append(f"{ticker}: pool {a['pool']} read failed: {e}")
     if problems:
         raise SystemExit("CONFIG ERRORS:\n  " + "\n  ".join(problems))
+
+DASH_HTML = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>US30 ONCHAIN</title><style>
+:root{--bg:#0a0e12;--card:#12181f;--line:#1f2a33;--txt:#d7e1ea;--dim:#5f7385;--grn:#31d07c;--red:#ff5c5c;--amb:#ffb84d}
+*{box-sizing:border-box;margin:0}body{background:var(--bg);color:var(--txt);font:15px/1.5 'SF Mono',Consolas,monospace;padding:24px;max-width:960px;margin:auto}
+h1{font-size:20px;letter-spacing:2px;color:var(--grn)}
+.sub{color:var(--dim);font-size:12px;margin-bottom:20px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:14px}
+.tk{font-size:17px;font-weight:bold}.mode{float:right;font-size:11px;padding:2px 8px;border-radius:10px;border:1px solid var(--line);color:var(--dim)}
+.mode.wknd{color:var(--amb);border-color:var(--amb)}
+.px{margin-top:8px;font-size:13px;color:var(--dim)}.px b{color:var(--txt);font-weight:normal}
+.drift{margin-top:8px;font-size:26px}.pos{color:var(--grn)}.neg{color:var(--red)}.na{color:var(--dim);font-size:16px}
+.ft{margin-top:22px;color:var(--dim);font-size:12px}
+</style></head><body>
+<h1>US30 ONCHAIN</h1><div class="sub">Robinhood Chain · pool vs Chainlink drift · auto-refresh 60s</div>
+<div class="grid" id="g"></div><div class="ft" id="ft"></div>
+<script>
+async function load(){
+ const r=await fetch('/data.json');const d=await r.json();
+ document.getElementById('g').innerHTML=d.assets.map(a=>{
+  const wk=a.stale&&a.pool_price;
+  const drift=a.drift_bps==null?'<span class="na">no pool</span>':
+   `<span class="${a.drift_bps>=0?'pos':'neg'}">${a.drift_bps>=0?'+':''}${a.drift_bps.toFixed(1)} bps</span>`;
+  return `<div class="card"><span class="mode ${wk?'wknd':''}">${a.pool_price?(wk?'WEEKEND DRIFT':'LIVE'):'FEED ONLY'}</span>
+  <div class="tk">${a.ticker}</div>
+  <div class="px">feed <b>${a.feed_price?a.feed_price.toFixed(2):'—'}</b> · pool <b>${a.pool_price?a.pool_price.toFixed(2):'—'}</b></div>
+  <div class="drift">${drift}</div>
+  <div class="px">feed age ${a.feed_age_min==null?'—':a.feed_age_min+'m'}</div></div>`}).join('');
+ document.getElementById('ft').textContent=`last cycle ${d.last_cycle||'—'} UTC · ${d.rows} readings logged · Dow coverage ${d.dow_coverage}/30`;
+}
+load();setInterval(load,60000);
+</script></body></html>"""
+
+def dash_payload():
+    con = sqlite3.connect(DB_PATH)
+    out, last_ts, rows = [], None, 0
+    try:
+        rows = con.execute("SELECT COUNT(*) FROM readings").fetchone()[0]
+        now = now_utc()
+        for tk in ASSETS:
+            r = con.execute(
+                "SELECT ts,feed_price,feed_updated,pool_price,drift_bps FROM readings "
+                "WHERE ticker=? ORDER BY ts DESC LIMIT 1", (tk,)).fetchone()
+            if not r:
+                out.append({"ticker": tk, "feed_price": None, "pool_price": None,
+                            "drift_bps": None, "feed_age_min": None, "stale": False})
+                continue
+            ts, fp, fu, pp, dr = r
+            last_ts = max(last_ts or ts, ts)
+            age = int((now - fu) / 60) if fu else None
+            out.append({"ticker": tk, "feed_price": fp, "pool_price": pp, "drift_bps": dr,
+                        "feed_age_min": age,
+                        "stale": bool(fu and (now - fu) > FEED_STALE_SECONDS)})
+        known = json.loads(kv_get(con, "known_tickers", "[]"))
+        cov = len([t for t in known if t in DOW_30]) if known else 4
+    finally:
+        con.close()
+    return {"assets": out, "rows": rows, "dow_coverage": cov,
+            "last_cycle": datetime.fromtimestamp(last_ts, timezone.utc).strftime("%H:%M:%S") if last_ts else None}
+
+class DashHandler(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        if self.path.startswith("/data.json"):
+            body = json.dumps(dash_payload()).encode()
+            ctype = "application/json"
+        else:
+            body = DASH_HTML.encode()
+            ctype = "text/html; charset=utf-8"
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+def start_dashboard():
+    port = int(os.environ.get("PORT", "8080"))
+    srv = ThreadingHTTPServer(("0.0.0.0", port), DashHandler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    print(f"Dashboard serving on port {port}")
 
 def main():
     con = db()
     w3 = connect()
     print(f"Connected to Robinhood Chain (id {CHAIN_ID}) via {RPC_URL}")
     validate_config(w3)
+    start_dashboard()
     tg_send("📡 US30 ONCHAIN monitor started.")
     last_coverage_check = 0
     while True:
